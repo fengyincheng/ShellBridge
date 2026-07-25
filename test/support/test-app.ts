@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, rm, writeFile, access } from "node:fs/promises";
+import { realpathSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -108,9 +109,23 @@ export async function createTestApp(options: {
     });
   const fastify = await buildApp(
     config,
-    process.env.SHELLBRIDGE_TEST_FAKE_SANDBOX === "1"
-      ? { sandboxedShell: nestedProjectTaskSandbox(fixtureDir) }
-      : {},
+    {
+      ...(process.env.SHELLBRIDGE_TEST_FAKE_SANDBOX === "1"
+        ? { sandboxedShell: nestedProjectTaskSandbox(fixtureDir) }
+        : {}),
+      resolveApprovalSmokeState: asyncConfig => {
+        const directory = realpathSync(asyncConfig.approvalSmokeDirectory);
+        const enabledFile = realpathSync(asyncConfig.approvalSmokeEnabledFile);
+        const enabledStat = statSync(enabledFile);
+        return {
+          directory,
+          enabled_file: enabledFile,
+          enabled_dev: enabledStat.dev,
+          enabled_ino: enabledStat.ino,
+          enabled_mtime_ms: enabledStat.mtimeMs,
+        };
+      },
+    },
   );
   const authHeaders = { authorization: `Bearer ${token}` };
 

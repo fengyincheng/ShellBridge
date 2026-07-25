@@ -65,9 +65,13 @@ function isValidCommandInput(input: unknown): input is CommandInput {
     && (item.max_output_bytes === undefined || (Number.isInteger(item.max_output_bytes) && Number(item.max_output_bytes) >= 1 && Number(item.max_output_bytes) <= COMMAND_OUTPUT_MAX_BYTES));
 }
 
-function validateSmokeProposal(payload: ApprovalSmokeProposal, config: GatewayConfig): void {
+function validateSmokeProposal(
+  payload: ApprovalSmokeProposal,
+  config: GatewayConfig,
+  resolveSmokeState: (config: GatewayConfig) => SmokeState,
+): void {
   let current;
-  try { current = getApprovalSmokeState(config); } catch { throw new ProposalError("approval_smoke_state_changed"); }
+  try { current = resolveSmokeState(config); } catch { throw new ProposalError("approval_smoke_state_changed"); }
   if (payload.operation !== "create_empty_file"
     || !/^smoke-[0-9a-f-]{36}\.empty$/.test(payload.filename)
     || payload.directory !== current.directory
@@ -87,10 +91,11 @@ function validateProposalForExecution(
   config: GatewayConfig,
   git: GitService,
   scripts: ExistingScriptRunner,
+  resolveSmokeState: (config: GatewayConfig) => SmokeState,
 ): ExecutableProposalKind {
   const payload = proposal.payload as Record<string, unknown>;
   if (payload.kind === "approval_smoke") {
-    validateSmokeProposal(payload as unknown as ApprovalSmokeProposal, config);
+    validateSmokeProposal(payload as unknown as ApprovalSmokeProposal, config, resolveSmokeState);
     return "approval_smoke";
   }
   if (payload.kind === "git_commit") {
@@ -136,6 +141,7 @@ function operationErrorReply(error: unknown, reply: FastifyReply) {
 interface AppDependencies {
   sandboxedShell?: Pick<SandboxedShell, "run">;
   configInspector?: Pick<ConfigInspector, "inspect">;
+  resolveApprovalSmokeState?: (config: GatewayConfig) => SmokeState;
 }
 
 export async function buildApp(config: GatewayConfig = createConfig(), dependencies: AppDependencies = {}): Promise<FastifyInstance> {
@@ -184,6 +190,7 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
   const git = new GitService(config.operationRoot, config.sandboxBlockedPaths);
   const projectTasks = new ProjectTaskRunner(config.operationRoot, config.sandboxBlockedPaths, sandboxedShell);
   const existingScripts = new ExistingScriptRunner(config.operationRoot, config.sandboxBlockedPaths);
+  const resolveApprovalSmokeState = dependencies.resolveApprovalSmokeState ?? getApprovalSmokeState;
   const registrationAttempts = new Map<string, { count: number; resetAt: number }>();
   const consentFailures = new Map<string, { count: number; resetAt: number }>();
   const limited = (bucket: Map<string, { count: number; resetAt: number }>, key: string, maximum: number, windowMs: number) => {
@@ -415,7 +422,7 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
   });
   app.post("/v1/shell/approval-smoke", async (_request, reply) => {
     let smoke;
-    try { smoke = getApprovalSmokeState(config); } catch { return reply.code(409).send({ error: "approval_smoke_disabled" }); }
+    try { smoke = resolveApprovalSmokeState(config); } catch { return reply.code(409).send({ error: "approval_smoke_disabled" }); }
     const payload: ApprovalSmokeProposal = { kind: "approval_smoke", operation: "create_empty_file", filename: `smoke-${crypto.randomUUID()}.empty`, ...smoke };
     const expires = new Date(Date.now() + config.proposalTtlMs).toISOString();
     const id = store.createProposal(payload, proposalHash(payload), expires, OWNER_PRINCIPAL_ID);
@@ -452,9 +459,9 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
       if (!config.writeActionsEnabled) return reply.code(403).send({ error: "write_actions_disabled" });
       if (currentKind === "git_commit" && !config.localGitWritesEnabled) return reply.code(403).send({ error: "local_git_writes_disabled" });
       if (currentKind === "existing_script_run" && !config.existingScriptRunsEnabled) return reply.code(403).send({ error: "existing_script_runs_disabled" });
-      validateProposalForExecution(current, config, git, existingScripts);
+      validateProposalForExecution(current, config, git, existingScripts, resolveApprovalSmokeState);
       const claimed = store.claimProposal(request.params.approval_id, OWNER_PRINCIPAL_ID, (proposal) => {
-        validateProposalForExecution(proposal, config, git, existingScripts);
+        validateProposalForExecution(proposal, config, git, existingScripts, resolveApprovalSmokeState);
       });
       const payload = claimed.payload as ApprovalSmokeProposal | GitCommitProposal | ExistingScriptProposal;
       try {

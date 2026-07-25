@@ -280,6 +280,7 @@ describe("ShellBridge command API", () => {
     const app = await createTestApp({ approvalSmokeEnabled: true });
     apps.push(app);
     const prepared = await app.fastify.inject({ method: "POST", url: "/v1/shell/approval-smoke", headers: app.authHeaders });
+    expect(prepared.statusCode).toBe(202);
     const approvalId = prepared.json().approval_id as string;
     const mcp = await initializeMcp(app);
 
@@ -319,6 +320,7 @@ describe("ShellBridge command API", () => {
     const app = await createTestApp({ approvalSmokeEnabled: true, proposalTtlMs: -1 });
     apps.push(app);
     const prepared = await app.fastify.inject({ method: "POST", url: "/v1/shell/approval-smoke", headers: app.authHeaders });
+    expect(prepared.statusCode).toBe(202);
     const approvalId = prepared.json().approval_id as string;
 
     const inspected = await app.fastify.inject({ method: "GET", url: `/v1/shell/approvals/${approvalId}`, headers: app.authHeaders });
@@ -335,6 +337,7 @@ describe("ShellBridge command API", () => {
     const app = await createTestApp({ approvalSmokeEnabled: true });
     apps.push(app);
     const prepared = await app.fastify.inject({ method: "POST", url: "/v1/shell/approval-smoke", headers: app.authHeaders });
+    expect(prepared.statusCode).toBe(202);
     const approvalId = prepared.json().approval_id as string;
 
     const attempts = await Promise.all([
@@ -400,6 +403,7 @@ describe("ShellBridge command API", () => {
     const principalApp = await createTestApp({ approvalSmokeEnabled: true });
     apps.push(principalApp);
     const principalPrepared = await principalApp.fastify.inject({ method: "POST", url: "/v1/shell/approval-smoke", headers: principalApp.authHeaders });
+    expect(principalPrepared.statusCode).toBe(202);
     const principalId = principalPrepared.json().approval_id as string;
     let db = new Database(databasePath(principalApp));
     db.prepare("UPDATE proposals SET principal_id='other-principal' WHERE id=?").run(principalId);
@@ -410,6 +414,7 @@ describe("ShellBridge command API", () => {
     const hashApp = await createTestApp({ approvalSmokeEnabled: true });
     apps.push(hashApp);
     const hashPrepared = await hashApp.fastify.inject({ method: "POST", url: "/v1/shell/approval-smoke", headers: hashApp.authHeaders });
+    expect(hashPrepared.statusCode).toBe(202);
     const hashId = hashPrepared.json().approval_id as string;
     db = new Database(databasePath(hashApp));
     db.prepare("UPDATE proposals SET hash=? WHERE id=?").run("0".repeat(64), hashId);
@@ -433,6 +438,7 @@ describe("ShellBridge command API", () => {
     const stateApp = await createTestApp({ approvalSmokeEnabled: true });
     apps.push(stateApp);
     const statePrepared = await stateApp.fastify.inject({ method: "POST", url: "/v1/shell/approval-smoke", headers: stateApp.authHeaders });
+    expect(statePrepared.statusCode).toBe(202);
     const stateId = statePrepared.json().approval_id as string;
     await (await import("node:fs/promises")).unlink(`${stateApp.smokeDir}/enabled`);
     const stateExecution = await stateApp.fastify.inject({ method: "POST", url: `/v1/shell/approvals/${stateId}/execute`, headers: stateApp.authHeaders });
