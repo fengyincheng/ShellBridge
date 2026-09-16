@@ -16,6 +16,50 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.env.SHELLBRIDGE_NATIVE_ACCEPTANCE !== "1")("SandboxedShell", () => {
+  test("mounts only an explicit project scope and masks external links and protected hard-link aliases", async () => {
+    const parent = await mkdtemp(path.join(process.cwd(), ".shellbridge-explicit-scope-"));
+    const project = path.join(parent, "project");
+    const sibling = path.join(parent, "sibling");
+    const protectedSource = path.join(parent, "protected");
+    temporaryPaths.push(parent);
+    await mkdir(project);
+    await mkdir(sibling);
+    await mkdir(protectedSource);
+    await writeFile(path.join(project, "visible.txt"), "project-visible\n");
+    await writeFile(path.join(sibling, "secret.txt"), "sibling-secret\n");
+    await symlink("../sibling/secret.txt", path.join(project, "escape.txt"));
+    const protectedFile = path.join(protectedSource, "credential.txt");
+    await writeFile(protectedFile, "protected\n");
+    await link(protectedFile, path.join(project, "ordinary-name.txt"));
+
+    const shell = new SandboxedShell({
+      helperPath: path.resolve("dist/native/shellbridge-helper"),
+      seccompPath: path.resolve("dist/native/network-deny.bpf"),
+      bwrapPath: "/usr/bin/bwrap",
+      readRoots: [parent],
+      blockedPaths: [protectedSource, "/etc/shadow"],
+      observerUid: 65534,
+      observerGid: 65534,
+      cgroupRoot: "/sys/fs/cgroup/unused",
+      requireCgroup: false,
+    });
+    const result = await shell.run({
+      command: [
+        "set -eu",
+        "test \"$(cat visible.txt)\" = project-visible",
+        "test ! -r ../sibling/secret.txt",
+        "test ! -r escape.txt",
+        "test ! -r ordinary-name.txt",
+      ].join("\n"),
+      cwd: project,
+      readScope: project,
+      timeoutMs: 10_000,
+      maxOutputBytes: 16 * 1024,
+    });
+
+    expect(result, JSON.stringify(result)).toMatchObject({ exitCode: 0, stdout: "", stderr: "" });
+  });
+
   test("presents a complete read-only root while masking exact sensitive descendants", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "shellbridge-root-view-"));
     temporaryPaths.push(root);

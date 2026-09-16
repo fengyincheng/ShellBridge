@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "vitest";
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
+import { request as httpRequest, type ClientRequest } from "node:http";
 import Database from "better-sqlite3";
 import path from "node:path";
 import { createTestApp, type TestApp } from "./support/test-app.js";
@@ -47,7 +48,7 @@ describe("ShellBridge command API", () => {
     const health = await app.fastify.inject({ method: "GET", url: "/health", headers: app.authHeaders });
     expect(health.statusCode).toBe(200);
     expect(health.json()).toMatchObject({
-      version: "0.3.0",
+      version: "0.4.0",
       write_actions_enabled: false,
       document_writes_enabled: false,
       local_git_writes_enabled: false,
@@ -55,7 +56,7 @@ describe("ShellBridge command API", () => {
     });
     const schema = await app.fastify.inject({ method: "GET", url: "/openapi.json" });
     expect(schema.json()).toMatchObject({
-      info: { version: "0.3.0" },
+      info: { version: "0.4.0" },
       servers: [{ url: "https://bridge.example.test" }],
     });
     const authorization = await app.fastify.inject({
@@ -72,6 +73,17 @@ describe("ShellBridge command API", () => {
     expect(unauthorized.statusCode).toBe(401);
   });
 
+  test("publishes the explicit read scope contract in OpenAPI", async () => {
+    const app = await createTestApp();
+    apps.push(app);
+
+    const response = await app.fastify.inject({ method: "GET", url: "/openapi.json" });
+    const schema = response.json().components.schemas.CommandRequest;
+
+    expect(response.statusCode).toBe(200);
+    expect(schema.properties.read_scope).toMatchObject({ pattern: "^/", maxLength: 4096 });
+    expect(schema.required).toEqual(["command"]);
+  });
   test("executes an ordinary read without creating an approval", async () => {
     const app = await createTestApp();
     apps.push(app);
@@ -87,6 +99,290 @@ describe("ShellBridge command API", () => {
       status: "completed",
       stdout: "hello",
     });
+  });
+
+  test("passes an explicit read scope and defaults cwd to that scope", async () => {
+    const calls: Array<{ cwd: string; readScope: string | undefined }> = [];
+    const app = await createTestApp({
+      sandboxedShell: {
+        async run(input) {
+          calls.push({ cwd: input.cwd, readScope: input.readScope });
+          return { stdout: "scoped", stderr: "", exitCode: 0, truncated: false };
+        },
+      },
+    });
+    apps.push(app);
+
+    const response = await app.injectCommand({ command: "printf scoped", read_scope: app.fixtureDir });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().stdout).toBe("scoped");
+    expect(calls).toEqual([{ cwd: app.fixtureDir, readScope: app.fixtureDir }]);
+  });
+
+  test("rejects a cwd outside an explicit read scope before execution", async () => {
+    let calls = 0;
+    const app = await createTestApp({
+      sandboxedShell: {
+        async run() {
+          calls += 1;
+          throw new Error("runner_must_not_start");
+        },
+      },
+    });
+    apps.push(app);
+
+    const response = await app.injectCommand({
+      command: "cat outside.txt",
+      cwd: path.dirname(app.fixtureDir),
+      read_scope: app.fixtureDir,
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: "cwd_outside_sandbox_roots" });
+    expect(calls).toBe(0);
+  });
+
+  test("propagates per-item read scopes through an explicit batch", async () => {
+    const calls: Array<{ cwd: string; readScope?: string }> = [];
+    const app = await createTestApp({
+      sandboxedShell: {
+        async run(input) {
+          calls.push({ cwd: input.cwd, ...(input.readScope === undefined ? {} : { readScope: input.readScope }) });
+          return { stdout: "ok", stderr: "", exitCode: 0, truncated: false };
+        },
+      },
+    });
+    apps.push(app);
+
+    const response = await app.fastify.inject({
+      method: "POST",
+      url: "/v1/shell/batches",
+      headers: app.authHeaders,
+      payload: {
+        commands: [
+          { command: "printf one", read_scope: app.fixtureDir },
+          { command: "printf two", cwd: app.fixtureDir },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(calls).toEqual([
+      { cwd: app.fixtureDir, readScope: app.fixtureDir },
+      { cwd: app.fixtureDir },
+    ]);
+  });
+
+  test("rejects a scope outside configured read roots without invoking the runner", async () => {
+    let calls = 0;
+    const app = await createTestApp({
+      sandboxedShell: {
+        async run() {
+          calls += 1;
+          throw new Error("runner_must_not_start");
+        },
+      },
+    });
+    apps.push(app);
+
+    const response = await app.injectCommand({ command: "true", read_scope: path.dirname(app.fixtureDir) });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: "read_scope_outside_sandbox_roots" });
+    expect(calls).toBe(0);
+  });
+
+  test("reports a retryable command timeout without collapsing it to sandbox unavailable", async () => {
+    const app = await createTestApp({
+      sandboxedShell: {
+        async run() {
+          throw new Error("sandbox_timeout");
+        },
+      },
+    });
+    apps.push(app);
+
+    const response = await app.injectCommand({
+      command: "sleep 2",
+      cwd: app.fixtureDir,
+      timeout_ms: 1_234,
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: "sandbox_timeout",
+      phase: "command_execution",
+      reason: "command_deadline_exceeded",
+      retryable: true,
+      timeout_ms: 1_234,
+    });
+  });
+
+  test("maps sandbox failures to an allowlisted public contract", async () => {
+    const cases = [
+      {
+        thrown: "sandbox_output_limit_exceeded",
+        expected: { error: "sandbox_output_limit_exceeded", phase: "command_execution", reason: "output_limit_exceeded", retryable: false },
+      },
+      {
+        thrown: "sandbox_unavailable:cgroup_attach_failed",
+        expected: { error: "sandbox_unavailable", phase: "cgroup_setup", reason: "cgroup_attach_failed", retryable: true },
+      },
+      {
+        thrown: "sandbox_unavailable:sandbox_spawn_failed",
+        expected: { error: "sandbox_unavailable", phase: "sandbox_spawn", reason: "sandbox_spawn_failed", retryable: true },
+      },
+      {
+        thrown: "sandbox_root_contains_nested_mount",
+        expected: { error: "sandbox_policy_failure", phase: "root_view_prepare", reason: "nested_mount_detected", retryable: false },
+      },
+      {
+        thrown: "sandbox_runtime_validation_failed",
+        expected: { error: "sandbox_policy_failure", phase: "runtime_validation", reason: "runtime_validation_failed", retryable: false },
+      },
+      {
+        thrown: "secret failure at /root/.ssh/id_ed25519",
+        expected: { error: "sandbox_unavailable", phase: "sandbox_spawn", reason: "sandbox_setup_failed", retryable: true },
+      },
+    ] as const;
+
+    for (const item of cases) {
+      const app = await createTestApp({
+        sandboxedShell: {
+          async run() {
+            throw new Error(item.thrown);
+          },
+        },
+      });
+      apps.push(app);
+
+      const response = await app.injectCommand({ command: "printf test", cwd: app.fixtureDir });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual(item.expected);
+      expect(response.body).not.toContain("id_ed25519");
+    }
+  });
+
+  test("recovers a degraded sandbox capability after readiness initially fails", async () => {
+    let initializationAttempts = 0;
+    let runs = 0;
+    let recoveryEntered!: () => void;
+    let releaseRecovery!: () => void;
+    const recoveryEnteredGate = new Promise<void>((resolve) => { recoveryEntered = resolve; });
+    const recoveryGate = new Promise<void>((resolve) => { releaseRecovery = resolve; });
+    const app = await createTestApp({
+      sandboxedShell: {
+        async initialize() {
+          initializationAttempts += 1;
+          if (initializationAttempts === 1) throw new Error("sandbox_private_key_scan_failed");
+          recoveryEntered();
+          await recoveryGate;
+        },
+        async run() {
+          runs += 1;
+          return { stdout: "recovered", stderr: "", exitCode: 0, truncated: false };
+        },
+      },
+    });
+    apps.push(app);
+
+    const degraded = await app.fastify.inject({ method: "GET", url: "/health", headers: app.authHeaders });
+    expect(degraded.statusCode).toBe(200);
+    expect(degraded.json().capabilities).toEqual({
+      sandboxed_read_shell: {
+        status: "degraded",
+        error: "sandbox_timeout",
+        phase: "root_view_prepare",
+        reason: "root_view_deadline_exceeded",
+        retryable: true,
+      },
+    });
+
+    const recoveries = [
+      app.injectCommand({ command: "printf recovered-1", cwd: app.fixtureDir }),
+      app.injectCommand({ command: "printf recovered-2", cwd: app.fixtureDir }),
+    ];
+    await recoveryEnteredGate;
+    releaseRecovery();
+    const recovered = await Promise.all(recoveries);
+    expect(recovered.every((response) => response.statusCode === 200)).toBe(true);
+    expect(recovered.every((response) => response.json().stdout === "recovered")).toBe(true);
+    expect(initializationAttempts).toBe(2);
+    expect(runs).toBe(2);
+
+    const ready = await app.fastify.inject({ method: "GET", url: "/health", headers: app.authHeaders });
+    expect(ready.json().capabilities).toEqual({ sandboxed_read_shell: { status: "ready" } });
+  });
+
+  test("keeps the sandbox degraded after a failed lazy retry and recovers later", async () => {
+    let initializationAttempts = 0;
+    let runs = 0;
+    const app = await createTestApp({
+      sandboxedShell: {
+        async initialize() {
+          initializationAttempts += 1;
+          if (initializationAttempts < 3) throw new Error("sandbox_private_key_scan_failed");
+        },
+        async run() {
+          runs += 1;
+          return { stdout: "recovered-later", stderr: "", exitCode: 0, truncated: false };
+        },
+      },
+    });
+    apps.push(app);
+
+    const failedRetry = await app.injectCommand({ command: "printf first-retry", cwd: app.fixtureDir });
+    expect(failedRetry.statusCode).toBe(503);
+    expect(failedRetry.json()).toMatchObject({
+      error: "sandbox_timeout",
+      phase: "root_view_prepare",
+      reason: "root_view_deadline_exceeded",
+      retryable: true,
+    });
+    const stillDegraded = await app.fastify.inject({ method: "GET", url: "/health", headers: app.authHeaders });
+    expect(stillDegraded.json().capabilities.sandboxed_read_shell.status).toBe("degraded");
+
+    const recovered = await app.injectCommand({ command: "printf second-retry", cwd: app.fixtureDir });
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json().stdout).toBe("recovered-later");
+    expect(initializationAttempts).toBe(3);
+    expect(runs).toBe(1);
+    const ready = await app.fastify.inject({ method: "GET", url: "/health", headers: app.authHeaders });
+    expect(ready.json().capabilities.sandboxed_read_shell).toEqual({ status: "ready" });
+  });
+
+  test("does not retry a permanently unavailable sandbox environment", async () => {
+    let initializationAttempts = 0;
+    const app = await createTestApp({
+      sandboxedShell: {
+        async initialize() {
+          initializationAttempts += 1;
+          throw new Error("sandbox_unavailable:cgroup_root_missing");
+        },
+        async run() {
+          throw new Error("command_must_not_start");
+        },
+      },
+    });
+    apps.push(app);
+
+    const health = await app.fastify.inject({ method: "GET", url: "/health", headers: app.authHeaders });
+    expect(health.json().capabilities.sandboxed_read_shell).toEqual({
+      status: "degraded",
+      error: "sandbox_unavailable",
+      phase: "cgroup_setup",
+      reason: "cgroup_root_missing",
+      retryable: false,
+    });
+
+    const first = await app.injectCommand({ command: "true", cwd: app.fixtureDir });
+    const second = await app.injectCommand({ command: "true", cwd: app.fixtureDir });
+    expect(first.statusCode).toBe(503);
+    expect(second.statusCode).toBe(503);
+    expect(first.json()).toEqual(second.json());
+    expect(initializationAttempts).toBe(1);
   });
 
   test("inspects registered config selectors but never returns an API key", async () => {
@@ -218,10 +514,63 @@ describe("ShellBridge command API", () => {
       payload: { commands: [{ command: "cat a.txt", cwd: app.fixtureDir }, { command: "touch b.txt", cwd: app.fixtureDir }] },
     });
     expect(batch.statusCode).toBe(200);
-    expect(batch.json()).toMatchObject({ classification: "read_only", execution_channel: "sandboxed_read_shell" });
+    expect(batch.json()).toMatchObject({
+      classification: "read_only",
+      execution_channel: "sandboxed_read_shell",
+      status: "failed",
+      failed_index: 1,
+    });
     expect(batch.json().results).toHaveLength(2);
     expect(batch.json().results[1]).toMatchObject({ status: "failed" });
     expect(await app.exists("b.txt")).toBe(false);
+  });
+
+  test("stops a batch on sandbox failure and preserves completed items with the failed index", async () => {
+    const commands: string[] = [];
+    const app = await createTestApp({
+      sandboxedShell: {
+        async run(input) {
+          commands.push(input.command);
+          if (commands.length === 2) throw new Error("sandbox_unavailable:cgroup_attach_failed");
+          return { stdout: input.command, stderr: "", exitCode: 0, truncated: false };
+        },
+      },
+    });
+    apps.push(app);
+
+    const response = await app.fastify.inject({
+      method: "POST",
+      url: "/v1/shell/batches",
+      headers: app.authHeaders,
+      payload: {
+        commands: [
+          { command: "printf first", cwd: app.fixtureDir },
+          { command: "printf second", cwd: app.fixtureDir },
+          { command: "printf third", cwd: app.fixtureDir },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      classification: "read_only",
+      execution_channel: "sandboxed_read_shell",
+      status: "failed",
+      failed_index: 1,
+      error: "sandbox_unavailable",
+      phase: "cgroup_setup",
+      reason: "cgroup_attach_failed",
+      retryable: true,
+      results: [{
+        classification: "read_only",
+        execution_channel: "sandboxed_read_shell",
+        status: "completed",
+        stdout: "printf first",
+        stderr: "",
+        exit_code: 0,
+      }],
+    });
+    expect(commands).toEqual(["printf first", "printf second"]);
   });
 
   test("supports Streamable HTTP MCP initialize, tool discovery, and a read call", async () => {
@@ -231,6 +580,7 @@ describe("ShellBridge command API", () => {
     const listed = await app.fastify.inject({ method: "POST", url: "/mcp", headers: mcp.headers, payload: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } });
     expect(listed.statusCode).toBe(200);
     expect(listed.body).toContain("run_shell_command");
+    expect(listed.body).toContain("read_scope");
     expect(listed.body).toContain("inspect_config");
     expect(listed.body).toContain("run_project_task");
     expect(listed.body).toContain("write_text_document");
@@ -247,7 +597,17 @@ describe("ShellBridge command API", () => {
     expect(listed.body).toContain("\"destructiveHint\":true");
     expect(listed.body).toContain("\"idempotentHint\":true");
     expect(listed.body).toContain("readOnlyHint");
-    const tools = listed.json().result.tools as Array<{ name: string; annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean } }>;
+    const tools = listed.json().result.tools as Array<{ name: string; description?: string; annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean } }>;
+    const commandDescription = tools.find((tool) => tool.name === "run_shell_command")?.description ?? "";
+    expect(commandDescription).toContain("fresh read-only Bubblewrap sandbox");
+    expect(commandDescription).toContain("combine related diagnostic commands");
+    expect(commandDescription).toContain("Do not split them into parallel sandbox calls");
+    expect(commandDescription).toContain("retryable=true");
+    expect(commandDescription).toContain("cwd does not reduce the root-wide view preparation");
+    const batchDescription = tools.find((tool) => tool.name === "run_shell_batch")?.description ?? "";
+    expect(batchDescription).toContain("not a performance optimization");
+    expect(batchDescription).toContain("fresh sandbox");
+    expect(batchDescription).toContain("prefer run_shell_command");
     for (const name of ["run_shell_command", "inspect_config", "run_project_task", "get_git_status", "prepare_git_commit"]) {
       expect(tools.find((tool) => tool.name === name)?.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
     }
@@ -276,6 +636,67 @@ describe("ShellBridge command API", () => {
     expect(closed.statusCode, closed.body).toBe(200);
   });
 
+  test("returns the REST sandbox error contract unchanged through MCP", async () => {
+    const app = await createTestApp({
+      sandboxedShell: {
+        async run() {
+          throw new Error("sandbox_unavailable:cgroup_attach_failed");
+        },
+      },
+    });
+    apps.push(app);
+    const mcp = await initializeMcp(app);
+
+    const called = await app.fastify.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: mcp.headers,
+      payload: {
+        jsonrpc: "2.0",
+        id: 40,
+        method: "tools/call",
+        params: { name: "run_shell_command", arguments: { command: "printf hello", cwd: app.fixtureDir } },
+      },
+    });
+
+    expect(called.statusCode).toBe(200);
+    const toolResult = called.json().result as { isError: boolean; content: Array<{ text: string }> };
+    expect(toolResult.isError).toBe(true);
+    expect(JSON.parse(toolResult.content[0]!.text)).toEqual({
+      error: "sandbox_unavailable",
+      phase: "cgroup_setup",
+      reason: "cgroup_attach_failed",
+      retryable: true,
+    });
+  });
+
+  test("preserves sandbox diagnostics for project task failures", async () => {
+    const app = await createTestApp({
+      files: { "package.json": JSON.stringify({ scripts: { test: "node --test" } }) },
+      sandboxedShell: {
+        async run() {
+          throw new Error("sandbox_unavailable:sandbox_spawn_failed");
+        },
+      },
+    });
+    apps.push(app);
+
+    const response = await app.fastify.inject({
+      method: "POST",
+      url: "/v1/tasks/run",
+      headers: app.authHeaders,
+      payload: { cwd: app.fixtureDir, package_script: "test" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: "sandbox_unavailable",
+      phase: "sandbox_spawn",
+      reason: "sandbox_spawn_failed",
+      retryable: true,
+    });
+  });
+
   test("execute_proposal rejects any command or cwd override at the MCP schema", async () => {
     const app = await createTestApp({ approvalSmokeEnabled: true });
     apps.push(app);
@@ -298,11 +719,11 @@ describe("ShellBridge command API", () => {
     expect(restOverride.statusCode).toBe(400);
   });
 
-  test("caps concurrent MCP session initialization", async () => {
-    const app = await createTestApp();
+  test("reclaims an idle MCP session at capacity instead of exhausting new clients", async () => {
+    const app = await createTestApp({ mcpSessionLimit: 2 });
     apps.push(app);
     const headers = { ...app.authHeaders, accept: "application/json, text/event-stream", "content-type": "application/json" };
-    const responses = await Promise.all(Array.from({ length: 65 }, (_, index) => app.fastify.inject({
+    const responses = await Promise.all(Array.from({ length: 2 }, (_, index) => app.fastify.inject({
       method: "POST",
       url: "/mcp",
       headers,
@@ -313,7 +734,250 @@ describe("ShellBridge command API", () => {
         params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "limit-test", version: "1.0.0" } },
       },
     })));
-    expect(responses.filter((response) => response.statusCode === 429)).toHaveLength(1);
+    expect(responses.every((response) => response.statusCode === 200)).toBe(true);
+
+    const replacement = await app.fastify.inject({
+      method: "POST",
+      url: "/mcp",
+      headers,
+      payload: {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "replacement-test", version: "1.0.0" } },
+      },
+    });
+
+    expect(replacement.statusCode, replacement.body).toBe(200);
+    const evictedSession = responses[0]!.headers["mcp-session-id"] as string;
+    const evictedRequest = await app.fastify.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: { ...headers, "mcp-session-id": evictedSession },
+      payload: { jsonrpc: "2.0", id: 4, method: "tools/list", params: {} },
+    });
+    expect(evictedRequest.statusCode).toBe(400);
+  });
+
+  test("reserves MCP capacity atomically during concurrent initialization", async () => {
+    const app = await createTestApp({ mcpSessionLimit: 1 });
+    apps.push(app);
+    const headers = { ...app.authHeaders, accept: "application/json, text/event-stream", "content-type": "application/json" };
+    let waiting = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    app.fastify.addHook("preHandler", async (request) => {
+      if (request.url !== "/mcp"
+          || !request.body || typeof request.body !== "object"
+          || !("method" in request.body) || request.body.method !== "initialize") return;
+      waiting += 1;
+      if (waiting === 2) release();
+      await gate;
+    });
+
+    const responses = await Promise.all([1, 2].map((id) => app.fastify.inject({
+      method: "POST",
+      url: "/mcp",
+      headers,
+      payload: {
+        jsonrpc: "2.0",
+        id,
+        method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "reservation-test", version: "1.0.0" } },
+      },
+    })));
+
+    expect(responses.map((response) => response.statusCode).sort()).toEqual([200, 429]);
+  });
+
+  test("returns MCP session 429 only while every retained session is in flight", async () => {
+    let entered = 0;
+    let releaseCalls!: () => void;
+    let allEntered!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseCalls = resolve; });
+    const enteredGate = new Promise<void>((resolve) => { allEntered = resolve; });
+    const app = await createTestApp({
+      mcpSessionLimit: 2,
+      sandboxedShell: {
+        async run() {
+          entered += 1;
+          if (entered === 2) allEntered();
+          await gate;
+          return { stdout: "done", stderr: "", exitCode: 0, truncated: false };
+        },
+      },
+    });
+    apps.push(app);
+    const sessions = [await initializeMcp(app), await initializeMcp(app)];
+    const activeCalls = sessions.map((session, index) => app.fastify.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: session.headers,
+      payload: {
+        jsonrpc: "2.0",
+        id: 10 + index,
+        method: "tools/call",
+        params: { name: "run_shell_command", arguments: { command: "printf done", cwd: app.fixtureDir } },
+      },
+    }));
+
+    await enteredGate;
+    try {
+      const headers = { ...app.authHeaders, accept: "application/json, text/event-stream", "content-type": "application/json" };
+      const blocked = await app.fastify.inject({
+        method: "POST",
+        url: "/mcp",
+        headers,
+        payload: {
+          jsonrpc: "2.0",
+          id: 12,
+          method: "initialize",
+          params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "active-limit-test", version: "1.0.0" } },
+        },
+      });
+      expect(blocked.statusCode).toBe(429);
+      expect(blocked.body).toContain("MCP session limit reached");
+    } finally {
+      releaseCalls();
+    }
+    expect((await Promise.all(activeCalls)).every((response) => response.statusCode === 200)).toBe(true);
+  });
+
+  test("garbage-collects stale idle MCP sessions", async () => {
+    const app = await createTestApp({ mcpSessionTtlMs: 20, mcpSessionLimit: 2 });
+    apps.push(app);
+    const session = await initializeMcp(app);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const stale = await app.fastify.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: session.headers,
+      payload: { jsonrpc: "2.0", id: 20, method: "tools/list", params: {} },
+    });
+
+    expect(stale.statusCode).toBe(400);
+    expect(stale.body).toContain("MCP session is missing or invalid");
+  });
+
+  test("does not garbage-collect an in-flight MCP session after its idle TTL", async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredGate = new Promise<void>((resolve) => { entered = resolve; });
+    const runGate = new Promise<void>((resolve) => { release = resolve; });
+    const app = await createTestApp({
+      mcpSessionTtlMs: 20,
+      mcpSessionLimit: 1,
+      sandboxedShell: {
+        async run() {
+          entered();
+          await runGate;
+          return { stdout: "done", stderr: "", exitCode: 0, truncated: false };
+        },
+      },
+    });
+    apps.push(app);
+    const session = await initializeMcp(app);
+    const active = app.fastify.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: session.headers,
+      payload: {
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: { name: "run_shell_command", arguments: { command: "printf done", cwd: app.fixtureDir } },
+      },
+    });
+
+    await enteredGate;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    try {
+      const headers = { ...app.authHeaders, accept: "application/json, text/event-stream", "content-type": "application/json" };
+      const blocked = await app.fastify.inject({
+        method: "POST",
+        url: "/mcp",
+        headers,
+        payload: {
+          jsonrpc: "2.0",
+          id: 22,
+          method: "initialize",
+          params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "ttl-test", version: "1.0.0" } },
+        },
+      });
+      expect(blocked.statusCode).toBe(429);
+    } finally {
+      release();
+    }
+    expect((await active).statusCode).toBe(200);
+  });
+
+  test.runIf(process.env.SHELLBRIDGE_SOCKET_TEST === "1")("releases an active MCP session when its client disconnects", async () => {
+    let entered!: () => void;
+    let releaseCall!: () => void;
+    let runFinished!: () => void;
+    const enteredGate = new Promise<void>((resolve) => { entered = resolve; });
+    const callGate = new Promise<void>((resolve) => { releaseCall = resolve; });
+    const finishedGate = new Promise<void>((resolve) => { runFinished = resolve; });
+    const app = await createTestApp({
+      mcpSessionLimit: 1,
+      sandboxedShell: {
+        async run() {
+          entered();
+          await callGate;
+          runFinished();
+          return { stdout: "done", stderr: "", exitCode: 0, truncated: false };
+        },
+      },
+    });
+    apps.push(app);
+    const headers = { ...app.authHeaders, accept: "application/json, text/event-stream", "content-type": "application/json" };
+    const initialized = await app.fastify.inject({
+      method: "POST",
+      url: "/mcp",
+      headers,
+      payload: { jsonrpc: "2.0", id: 30, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "disconnect-test", version: "1.0.0" } } },
+    });
+    expect(initialized.statusCode).toBe(200);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+    expect(sessionId).toBeTruthy();
+    const socketPath = path.join(path.dirname(app.fixtureDir), "mcp-test.sock");
+    await app.fastify.listen({ path: socketPath });
+
+    let activeRequest!: ClientRequest;
+    const clientClosed = new Promise<void>((resolve) => {
+      activeRequest = httpRequest({
+        socketPath,
+        path: "/mcp",
+        method: "POST",
+        headers: { ...headers, "mcp-session-id": sessionId, "mcp-protocol-version": "2025-03-26" },
+      });
+      activeRequest.once("error", () => resolve());
+      activeRequest.once("close", () => resolve());
+      activeRequest.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 31,
+        method: "tools/call",
+        params: { name: "run_shell_command", arguments: { command: "printf done", cwd: app.fixtureDir } },
+      }));
+    });
+
+    await enteredGate;
+    try {
+      activeRequest.destroy();
+      await clientClosed;
+      await new Promise((resolve) => setImmediate(resolve));
+      const replacement = await app.fastify.inject({
+        method: "POST",
+        url: "/mcp",
+        headers,
+        payload: { jsonrpc: "2.0", id: 32, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "disconnect-replacement", version: "1.0.0" } } },
+      });
+      expect(replacement.statusCode, replacement.body).toBe(200);
+    } finally {
+      releaseCall();
+      await finishedGate;
+    }
   });
 
   test.skipIf(process.env.SHELLBRIDGE_SANDBOXED_PROJECT_TASK === "1")("expires pending proposals consistently and never executes them", async () => {

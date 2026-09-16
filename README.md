@@ -27,7 +27,7 @@ Ask ChatGPT things like:
 
 General diagnostics run inside a read-only, network-isolated sandbox. Sensitive paths are hidden automatically. Persistent capabilities are narrow, disabled by default, and separately controlled by the server owner.
 
-> **Public Preview · v0.3.0**
+> **Public Preview · v0.4.0**
 >
 > Ubuntu 24.04 · Linux x86_64 · Node.js 22+
 
@@ -127,7 +127,7 @@ The service is still security-sensitive infrastructure: a root-managed process c
 
 ### Understand your VPS
 
-ChatGPT can use full Bash syntax inside a read-only view of the directories you choose.
+ChatGPT can use full Bash syntax inside a read-only view of the directories you choose. For a single project it can narrow one diagnostic to an absolute read scope, so the sandbox mounts only that project instead of the entire read root; a working directory outside the declared scope is rejected before anything runs.
 
 Typical tasks include:
 
@@ -476,7 +476,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md) rather than opening
 
 ## Public Preview
 
-ShellBridge v0.3.0 is an early public release. The security model, supported platform, configuration format, and MCP tools may change as the project receives real-world review.
+ShellBridge v0.4.0 is an early public release. The security model, supported platform, configuration format, and MCP tools may change as the project receives real-world review.
 
 Feedback, testing, documentation improvements, and carefully scoped contributions are welcome.
 

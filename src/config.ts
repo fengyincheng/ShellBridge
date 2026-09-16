@@ -15,6 +15,8 @@ export interface GatewayConfig {
   publicBaseUrl: string;
   oauthOwnerSecret: string;
   oauthRedirectHosts: string[];
+  mcpSessionTtlMs: number;
+  mcpSessionLimit: number;
   approvalSmokeDirectory: string;
   approvalSmokeEnabledFile: string;
   nativeHelperPath: string;
@@ -63,6 +65,14 @@ function normalizePublicBaseUrl(value: string): string {
     throw new Error("SHELLBRIDGE_PUBLIC_BASE_URL must not contain a query or fragment");
   }
   return url.toString().replace(/\/+$/, "");
+}
+
+function positiveInteger(name: string, fallback: number): number {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer`);
+  return parsed;
 }
 
 const defaultRootSensitivePaths = [
@@ -160,6 +170,8 @@ export function createConfig(overrides: ConfigOverrides = {}): GatewayConfig {
     publicBaseUrl: normalizePublicBaseUrl(overrides.publicBaseUrl ?? process.env.SHELLBRIDGE_PUBLIC_BASE_URL ?? "http://127.0.0.1:8765"),
     oauthOwnerSecret,
     oauthRedirectHosts: overrides.oauthRedirectHosts ?? (process.env.SHELLBRIDGE_OAUTH_REDIRECT_HOSTS?.split(",").filter(Boolean) ?? ["chatgpt.com", "chat.openai.com"]),
+    mcpSessionTtlMs: overrides.mcpSessionTtlMs ?? positiveInteger("SHELLBRIDGE_MCP_SESSION_TTL_MS", 60 * 60_000),
+    mcpSessionLimit: overrides.mcpSessionLimit ?? positiveInteger("SHELLBRIDGE_MCP_SESSION_LIMIT", 64),
     approvalSmokeDirectory: path.resolve(overrides.approvalSmokeDirectory ?? "/var/lib/shellbridge/approval-smoke"),
     approvalSmokeEnabledFile: path.resolve(overrides.approvalSmokeEnabledFile ?? "/var/lib/shellbridge/approval-smoke/enabled"),
     nativeHelperPath: path.resolve(overrides.nativeHelperPath ?? process.env.SHELLBRIDGE_NATIVE_HELPER_PATH ?? "dist/native/shellbridge-helper"),
