@@ -17,6 +17,12 @@ async function fixtureShell(helperBody: string, observe: (value: SandboxObservat
   const helperPath = path.join(root, "helper.sh");
   await writeFile(helperPath, `#!/bin/sh\n${helperBody}\n`, "utf8");
   await chmod(helperPath, 0o755);
+  // Blocked paths are opened read-only while preparing the view, so the target has to be
+  // readable by whoever runs the suite. A real system path such as /etc/shadow is only
+  // openable by root: the suite then passes under a root-managed local run and fails on an
+  // unprivileged CI runner, where the EACCES is reported as a generic setup failure.
+  const blockedPath = path.join(root, "blocked-secret.txt");
+  await writeFile(blockedPath, "blocked\n", "utf8");
   return {
     root,
     shell: new SandboxedShell({
@@ -24,12 +30,16 @@ async function fixtureShell(helperBody: string, observe: (value: SandboxObservat
       seccompPath: helperPath,
       bwrapPath: "/usr/bin/bwrap",
       readRoots: [root],
-      blockedPaths: ["/etc/shadow"],
+      blockedPaths: [blockedPath],
       observerUid: 65534,
       observerGid: 65534,
       cgroupRoot: path.join(root, "cgroup"),
       requireCgroup,
-      setupPhaseTimeoutMs: 30,
+      // Deliberately generous. These tests exercise the per-command deadline, so the
+      // per-setup-phase budget must not become the binding constraint: a tight budget
+      // expires during preparation and the timeout is classified against a setup phase
+      // instead of the intended one.
+      setupPhaseTimeoutMs: 30_000,
       observe,
     }),
   };
