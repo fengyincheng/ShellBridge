@@ -1,7 +1,12 @@
 import { describe, expect, test } from "vitest";
 import { createConfig } from "../src/config.js";
+import { COMMAND_TIMEOUT_DEFAULT_MS } from "../src/domain.js";
 
 describe("generic read shell configuration", () => {
+  test("gives the root-view preparation enough default time", () => {
+    expect(COMMAND_TIMEOUT_DEFAULT_MS).toBe(60_000);
+  });
+
   test("defaults to the complete /root view with a precise sensitive-resource denylist", () => {
     const config = createConfig({
       token: "test-token",

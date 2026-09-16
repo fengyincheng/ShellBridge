@@ -1,10 +1,10 @@
-import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import Fastify, { LogController, type FastifyInstance, type FastifyReply } from "fastify";
 import formbody from "@fastify/formbody";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { createConfig, type GatewayConfig } from "./config.js";
-import { COMMAND_MAX_LENGTH, COMMAND_OUTPUT_DEFAULT_BYTES, COMMAND_OUTPUT_MAX_BYTES, COMMAND_TIMEOUT_DEFAULT_MS, COMMAND_TIMEOUT_MAX_MS, OWNER_PRINCIPAL_ID } from "./domain.js";
+import { COMMAND_MAX_LENGTH, COMMAND_OUTPUT_DEFAULT_BYTES, COMMAND_OUTPUT_MAX_BYTES, COMMAND_TIMEOUT_DEFAULT_MS, COMMAND_TIMEOUT_MAX_MS, OWNER_PRINCIPAL_ID, READ_SCOPE_MAX_LENGTH } from "./domain.js";
 import { ProposalError, Store, proposalHash, type Proposal } from "./persistence.js";
 import { closeMcpSessions, handleMcpRequest } from "./mcp.js";
 import { OAuthService } from "./oauth.js";
@@ -17,17 +17,55 @@ import { GitService, type GitCommitProposal } from "./git-service.js";
 import { ProjectTaskRunner } from "./task-runner.js";
 import { ExistingScriptRunner, type ExistingScriptProposal } from "./existing-script-runner.js";
 import { SHELLBRIDGE_VERSION } from "./version.js";
+import { publicSandboxError, SandboxFailure } from "./sandbox-errors.js";
+import { SandboxCapability, type SandboxRunner } from "./sandbox-capability.js";
 
 export function createOpenApi(config: Pick<GatewayConfig, "publicBaseUrl">, version = SHELLBRIDGE_VERSION) {
   return {
     openapi: "3.1.0",
     info: { title: "ShellBridge", version, description: "Fast, safe, and auditable Linux VPS visibility for ChatGPT through MCP." },
     servers: [{ url: config.publicBaseUrl }],
-    components: { securitySchemes: { bearerAuth: { type: "apiKey", in: "header", name: "Authorization", description: "REST administration uses the complete Bearer value; MCP clients use restricted OAuth." } } },
+    components: {
+      securitySchemes: { bearerAuth: { type: "apiKey", in: "header", name: "Authorization", description: "REST administration uses the complete Bearer value; MCP clients use restricted OAuth." } },
+      schemas: {
+        CommandRequest: {
+          type: "object",
+          additionalProperties: false,
+          required: ["command"],
+          properties: {
+            command: { type: "string", minLength: 1, maxLength: COMMAND_MAX_LENGTH },
+            cwd: { type: "string", description: "Working directory; it must lie inside read_scope when one is set." },
+            read_scope: { type: "string", pattern: "^/", minLength: 1, maxLength: READ_SCOPE_MAX_LENGTH, description: "Optional absolute directory path. When set, only that single project scope is mounted; it does not widen to sibling directories or external dependencies. Omit it to keep the configured full read root." },
+            timeout_ms: { type: "integer", minimum: 1, maximum: COMMAND_TIMEOUT_MAX_MS },
+            max_output_bytes: { type: "integer", minimum: 1, maximum: COMMAND_OUTPUT_MAX_BYTES },
+          },
+        },
+        CommandBatchRequest: {
+          type: "object",
+          additionalProperties: false,
+          required: ["commands"],
+          properties: { commands: { type: "array", minItems: 1, maxItems: 10, items: { $ref: "#/components/schemas/CommandRequest" } } },
+        },
+      },
+    },
     security: [{ bearerAuth: [] }],
     paths: {
-      "/v1/shell/commands": { post: { operationId: "runShellCommand", summary: "Run one Bash diagnostic in the read-only Bubblewrap sandbox" } },
-      "/v1/shell/batches": { post: { operationId: "runShellBatch", summary: "Run an explicit diagnostic batch in separate read-only sandbox calls" } },
+      "/v1/shell/commands": {
+        post: {
+          operationId: "runShellCommand",
+          summary: "Run one read-only Bash diagnostic in an explicit project scope or the configured full root view",
+          description: "Set an absolute read_scope for project diagnostics; the service then mounts only that directory and requires cwd to lie inside it. Omitting read_scope keeps the configured full read-root compatibility behaviour.",
+          requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/CommandRequest" } } } },
+        },
+      },
+      "/v1/shell/batches": {
+        post: {
+          operationId: "runShellBatch",
+          summary: "Run an explicit read-only batch sequentially, each item in its own declared scope",
+          description: "Each batch item may set its own read_scope; when set, that item mounts a single directory and cwd must not escape it.",
+          requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/CommandBatchRequest" } } } },
+        },
+      },
       "/v1/inspect/config": { post: { operationId: "inspectConfig", summary: "Read exact registered configuration fields with mandatory redaction" } },
       "/v1/tasks/run": { post: { operationId: "runProjectTask", summary: "Run an existing project task in a disposable writable copy" } },
       "/v1/documents/write": { post: { operationId: "writeTextDocument", "x-openai-isConsequential": true, summary: "Atomically write a Markdown or text document" } },
@@ -46,6 +84,7 @@ export function createOpenApi(config: Pick<GatewayConfig, "publicBaseUrl">, vers
 interface CommandInput {
   command: string;
   cwd?: string;
+  read_scope?: string;
   timeout_ms?: number;
   max_output_bytes?: number;
 }
@@ -61,8 +100,51 @@ function isValidCommandInput(input: unknown): input is CommandInput {
   const item = input as Record<string, unknown>;
   return typeof item.command === "string" && item.command.length >= 1 && item.command.length <= COMMAND_MAX_LENGTH && !item.command.includes("\0")
     && (item.cwd === undefined || typeof item.cwd === "string")
+    && (item.read_scope === undefined || (typeof item.read_scope === "string" && item.read_scope.length >= 1
+      && item.read_scope.length <= READ_SCOPE_MAX_LENGTH && path.isAbsolute(item.read_scope) && !item.read_scope.includes("\0")))
     && (item.timeout_ms === undefined || (Number.isInteger(item.timeout_ms) && Number(item.timeout_ms) >= 1 && Number(item.timeout_ms) <= COMMAND_TIMEOUT_MAX_MS))
     && (item.max_output_bytes === undefined || (Number.isInteger(item.max_output_bytes) && Number(item.max_output_bytes) >= 1 && Number(item.max_output_bytes) <= COMMAND_OUTPUT_MAX_BYTES));
+}
+
+function inside(target: string, root: string): boolean {
+  return target === root || target.startsWith(`${root}${path.sep}`);
+}
+
+function resolveCommandCwd(input: CommandInput, config: GatewayConfig): string {
+  const cwd = path.resolve(input.cwd ?? input.read_scope ?? config.defaultCwd);
+  if (input.read_scope === undefined) return cwd;
+  const lexicalScope = path.resolve(input.read_scope);
+  let scopeMetadata: fs.Stats;
+  try { scopeMetadata = fs.lstatSync(lexicalScope); } catch { throw new Error("read_scope_invalid"); }
+  if (!scopeMetadata.isDirectory() || scopeMetadata.isSymbolicLink()) throw new Error("read_scope_invalid");
+  let scope: string;
+  let normalizedCwd: string;
+  try {
+    scope = fs.realpathSync(lexicalScope);
+    normalizedCwd = fs.realpathSync(cwd);
+  } catch { throw new Error("cwd_outside_sandbox_roots"); }
+  if (scope !== lexicalScope) throw new Error("read_scope_invalid");
+  if (!config.sandboxReadRoots.some((root) => {
+    try { return inside(scope, fs.realpathSync(root)); } catch { return false; }
+  })) throw new Error("read_scope_outside_sandbox_roots");
+  if (config.sandboxBlockedPaths.some((target) => {
+    const resolved = path.resolve(target);
+    try { return inside(scope, fs.realpathSync(resolved)); } catch { return inside(scope, resolved); }
+  })) throw new Error("read_scope_overlaps_blocked_path");
+  if (!inside(normalizedCwd, scope)) throw new Error("cwd_outside_sandbox_roots");
+  return cwd;
+}
+
+function isCommandRequestError(error: unknown): error is Error {
+  return error instanceof Error && [
+    "cwd_outside_sandbox_roots",
+    "read_scope_invalid",
+    "read_scope_outside_sandbox_roots",
+    "read_scope_overlaps_blocked_path",
+    "invalid_command",
+    "invalid_timeout",
+    "invalid_output_limit",
+  ].includes(error.message);
 }
 
 function validateSmokeProposal(
@@ -131,17 +213,20 @@ function capabilityError(capability: "document" | "git" | "script"): string {
 
 function operationErrorReply(error: unknown, reply: FastifyReply) {
   const code = error instanceof Error && /^[a-z0-9_: ./'-]+$/i.test(error.message) ? error.message : "operation_failed";
-  if (code === "sandbox_unavailable" || code.startsWith("sandbox_unavailable:")) return reply.code(503).send({ error: "sandbox_unavailable" });
+  if (error instanceof SandboxFailure || /^(?:sandbox|cgroup)_/.test(code)) {
+    return reply.code(503).send(publicSandboxError(error, { phase: "command_execution" }));
+  }
   if (code.includes("blocked") || code.includes("outside") || code.includes("not_allowed") || code.endsWith("_disabled")) {
     return reply.code(403).send({ error: code });
   }
   return reply.code(400).send({ error: code });
 }
 
-interface AppDependencies {
-  sandboxedShell?: Pick<SandboxedShell, "run">;
+export interface AppDependencies {
+  sandboxedShell?: SandboxRunner;
   configInspector?: Pick<ConfigInspector, "inspect">;
   resolveApprovalSmokeState?: (config: GatewayConfig) => SmokeState;
+  logger?: boolean;
 }
 
 export async function buildApp(config: GatewayConfig = createConfig(), dependencies: AppDependencies = {}): Promise<FastifyInstance> {
@@ -154,7 +239,11 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
   ]);
   fs.mkdirSync(path.dirname(config.databasePath), { recursive: true });
   fs.mkdirSync(config.defaultCwd, { recursive: true, mode: 0o700 });
-  const app = Fastify({ logger: false, bodyLimit: 256 * 1024 });
+  const app = Fastify({
+    logger: dependencies.logger ?? true,
+    logController: new LogController({ disableRequestLogging: true }),
+    bodyLimit: 256 * 1024,
+  });
   await app.register(formbody);
   const store = new Store(config);
   const oauth = new OAuthService(config);
@@ -166,10 +255,7 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
     maxBytes: 64 * 1024,
     timeoutMs: 2_000,
   });
-  let sandboxedShell = dependencies.sandboxedShell;
-  if (!sandboxedShell) {
-    try {
-      const concreteShell = new SandboxedShell({
+  const shellRunner = dependencies.sandboxedShell ?? new SandboxedShell({
         helperPath: config.nativeHelperPath,
         seccompPath: config.seccompFilterPath,
         bwrapPath: config.bwrapPath,
@@ -179,13 +265,15 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
         observerGid: config.observerGid,
         cgroupRoot: config.sandboxCgroupRoot,
         requireCgroup: config.sandboxRequireCgroup,
+        observe: (observation) => app.log.info({ component: "sandbox_run", ...observation }, "Sandbox run completed"),
       });
-      await concreteShell.initialize();
-      sandboxedShell = concreteShell;
-    } catch {
-      sandboxedShell = { run: async () => { throw new Error("sandbox_unavailable"); } };
-    }
-  }
+  const sandboxCapability = new SandboxCapability(shellRunner, (health) => {
+    const details = { component: "sandbox_capability", ...health };
+    if (health.status === "degraded") app.log.warn(details, "Sandbox capability degraded");
+    else app.log.info(details, "Sandbox capability ready");
+  });
+  await sandboxCapability.start();
+  const sandboxedShell = sandboxCapability;
   const documents = new DocumentWriter(config.operationRoot, config.sandboxBlockedPaths);
   const git = new GitService(config.operationRoot, config.sandboxBlockedPaths);
   const projectTasks = new ProjectTaskRunner(config.operationRoot, config.sandboxBlockedPaths, sandboxedShell);
@@ -215,6 +303,7 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
     document_writes_enabled: config.documentWritesEnabled,
     local_git_writes_enabled: config.localGitWritesEnabled,
     existing_script_runs_enabled: config.existingScriptRunsEnabled,
+    capabilities: { sandboxed_read_shell: sandboxCapability.health() },
   }));
   app.get("/openapi.json", async () => createOpenApi(config));
   app.get("/.well-known/oauth-authorization-server", async () => oauth.metadata());
@@ -275,10 +364,14 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
   });
   app.post<{ Body: CommandInput }>("/v1/shell/commands", async (request, reply) => {
     if (!isValidCommandInput(request.body)) return reply.code(400).send({ error: "invalid_request" });
+    let cwd: string;
+    try { cwd = resolveCommandCwd(request.body, config); }
+    catch (error) { return reply.code(400).send({ error: isCommandRequestError(error) ? error.message : "invalid_request" }); }
     try {
       const result = await sandboxedShell.run({
         command: request.body.command,
-        cwd: path.resolve(request.body.cwd ?? config.defaultCwd),
+        cwd,
+        ...(request.body.read_scope === undefined ? {} : { readScope: request.body.read_scope }),
         timeoutMs: request.body.timeout_ms ?? COMMAND_TIMEOUT_DEFAULT_MS,
         maxOutputBytes: request.body.max_output_bytes ?? COMMAND_OUTPUT_DEFAULT_BYTES,
       });
@@ -291,11 +384,12 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
         exit_code: result.exitCode,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "";
-      if (message === "cwd_outside_sandbox_roots" || message === "invalid_command" || message === "invalid_timeout" || message === "invalid_output_limit") {
-        return reply.code(400).send({ error: message });
-      }
-      return reply.code(503).send({ error: message.startsWith("sandbox_output_limit_exceeded") ? "sandbox_output_limit_exceeded" : "sandbox_unavailable" });
+      if (isCommandRequestError(error)) return reply.code(400).send({ error: error.message });
+      const publicError = publicSandboxError(error, {
+        phase: "command_execution",
+        timeoutMs: request.body.timeout_ms ?? COMMAND_TIMEOUT_DEFAULT_MS,
+      });
+      return reply.code(503).send(publicError);
     }
   });
   app.post<{ Body: { commands: CommandInput[] } }>("/v1/shell/batches", async (request, reply) => {
@@ -303,18 +397,48 @@ export async function buildApp(config: GatewayConfig = createConfig(), dependenc
     if (!Array.isArray(commands) || commands.length === 0 || commands.length > 10) return reply.code(400).send({ error: "commands_must_contain_1_to_10_items" });
     if (commands.some((item) => !isValidCommandInput(item))) return reply.code(400).send({ error: "invalid_command_item" });
     const results = [];
-    for (const command of commands) {
+    for (const [index, command] of commands.entries()) {
       try {
+        const cwd = resolveCommandCwd(command, config);
         const result = await sandboxedShell.run({
           command: command.command,
-          cwd: path.resolve(command.cwd ?? config.defaultCwd),
+          cwd,
+          ...(command.read_scope === undefined ? {} : { readScope: command.read_scope }),
           timeoutMs: command.timeout_ms ?? COMMAND_TIMEOUT_DEFAULT_MS,
           maxOutputBytes: command.max_output_bytes ?? COMMAND_OUTPUT_DEFAULT_BYTES,
         });
         results.push({ classification: "read_only", execution_channel: "sandboxed_read_shell", status: result.exitCode === 0 ? "completed" : "failed", stdout: result.stdout, stderr: result.stderr, exit_code: result.exitCode });
-        if (result.exitCode !== 0) break;
-      } catch {
-        return reply.code(503).send({ error: "sandbox_unavailable" });
+        if (result.exitCode !== 0) {
+          return reply.send({
+            classification: "read_only",
+            execution_channel: "sandboxed_read_shell",
+            status: "failed",
+            failed_index: index,
+            results,
+          });
+        }
+      } catch (error) {
+        if (isCommandRequestError(error)) {
+          return reply.code(400).send({
+            classification: "read_only",
+            execution_channel: "sandboxed_read_shell",
+            status: "failed",
+            failed_index: index,
+            error: error.message,
+            results,
+          });
+        }
+        return reply.code(503).send({
+          classification: "read_only",
+          execution_channel: "sandboxed_read_shell",
+          status: "failed",
+          failed_index: index,
+          ...publicSandboxError(error, {
+            phase: "command_execution",
+            timeoutMs: command.timeout_ms ?? COMMAND_TIMEOUT_DEFAULT_MS,
+          }),
+          results,
+        });
       }
     }
     return reply.send({ classification: "read_only", execution_channel: "sandboxed_read_shell", status: "completed", results });

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { FastifyInstance, InjectOptions } from "fastify";
-import { buildApp } from "../../src/app.js";
+import { buildApp, type AppDependencies } from "../../src/app.js";
 import { createConfig } from "../../src/config.js";
 import { redact } from "../../src/redactor.js";
 
@@ -46,9 +46,10 @@ export interface TestApp {
   smokeDir: string;
   databasePath: string;
   authHeaders: Record<string, string>;
-    injectCommand(body: {
+  injectCommand(body: {
     command: string;
     cwd?: string;
+    read_scope?: string;
     timeout_ms?: number;
     max_output_bytes?: number;
   }): Promise<Awaited<ReturnType<FastifyInstance["inject"]>>>;
@@ -64,6 +65,9 @@ export async function createTestApp(options: {
   existingScriptRunsEnabled?: boolean;
   approvalSmokeEnabled?: boolean;
   proposalTtlMs?: number;
+  mcpSessionTtlMs?: number;
+  mcpSessionLimit?: number;
+  sandboxedShell?: AppDependencies["sandboxedShell"];
 } = {}): Promise<TestApp> {
   const root = await mkdtemp(path.join(tmpdir(), "shellbridge-test-"));
   const fixtureDir = path.join(root, "fixture");
@@ -101,32 +105,32 @@ export async function createTestApp(options: {
       existingScriptRunsEnabled: options.existingScriptRunsEnabled ?? true,
       operationRoot: root,
       proposalTtlMs: options.proposalTtlMs ?? 60_000,
+      ...(options.mcpSessionTtlMs === undefined ? {} : { mcpSessionTtlMs: options.mcpSessionTtlMs }),
+      ...(options.mcpSessionLimit === undefined ? {} : { mcpSessionLimit: options.mcpSessionLimit }),
       oauthOwnerSecret: "test-oauth-owner-secret",
       publicBaseUrl: "https://bridge.example.test",
       oauthRedirectHosts: ["chatgpt.com"],
       approvalSmokeDirectory: smokeDir,
       approvalSmokeEnabledFile: smokeEnabledFile,
     });
-  const fastify = await buildApp(
-    config,
-    {
-      ...(process.env.SHELLBRIDGE_TEST_FAKE_SANDBOX === "1"
-        ? { sandboxedShell: nestedProjectTaskSandbox(fixtureDir) }
-        : {}),
-      resolveApprovalSmokeState: asyncConfig => {
-        const directory = realpathSync(asyncConfig.approvalSmokeDirectory);
-        const enabledFile = realpathSync(asyncConfig.approvalSmokeEnabledFile);
-        const enabledStat = statSync(enabledFile);
-        return {
-          directory,
-          enabled_file: enabledFile,
-          enabled_dev: enabledStat.dev,
-          enabled_ino: enabledStat.ino,
-          enabled_mtime_ms: enabledStat.mtimeMs,
-        };
-      },
+  const sandboxedShell = options.sandboxedShell
+    ?? (process.env.SHELLBRIDGE_TEST_FAKE_SANDBOX === "1" ? nestedProjectTaskSandbox(fixtureDir) : undefined);
+  const fastify = await buildApp(config, {
+    logger: false,
+    ...(sandboxedShell === undefined ? {} : { sandboxedShell }),
+    resolveApprovalSmokeState: asyncConfig => {
+      const directory = realpathSync(asyncConfig.approvalSmokeDirectory);
+      const enabledFile = realpathSync(asyncConfig.approvalSmokeEnabledFile);
+      const enabledStat = statSync(enabledFile);
+      return {
+        directory,
+        enabled_file: enabledFile,
+        enabled_dev: enabledStat.dev,
+        enabled_ino: enabledStat.ino,
+        enabled_mtime_ms: enabledStat.mtimeMs,
+      };
     },
-  );
+  });
   const authHeaders = { authorization: `Bearer ${token}` };
 
   return {
